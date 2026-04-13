@@ -27,9 +27,20 @@ import ipaddress
 import logging
 import os
 import socket
+import threading
+import time
+from typing import List, Optional
 from urllib.parse import urlparse
 
+from hermes_constants import get_hermes_home
+
 logger = logging.getLogger(__name__)
+
+# Cache for SSRF whitelist config (similar to website_policy.py pattern)
+_WHITELIST_CACHE_TTL = 30.0
+_whitelist_lock = threading.Lock()
+_cached_whitelist: Optional[List[ipaddress.IPv4Network | ipaddress.IPv6Network]] = None
+_whitelist_cache_time: float = 0.0
 
 # Hostnames that should always be blocked regardless of IP resolution
 # or any config toggle.  These are cloud metadata endpoints that an
@@ -129,8 +140,79 @@ def _reset_allow_private_cache() -> None:
     _cached_allow_private = False
 
 
+def _load_ssrf_whitelist() -> List[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Load SSRF whitelist from config.yaml.
+
+    Returns a list of IP networks that should be exempt from private/internal
+    checks. Caches results for 30 seconds to avoid repeated YAML parsing.
+    """
+    global _cached_whitelist, _whitelist_cache_time
+
+    now = time.monotonic()
+    with _whitelist_lock:
+        if _cached_whitelist is not None and (now - _whitelist_cache_time) < _WHITELIST_CACHE_TTL:
+            return _cached_whitelist
+
+    config_path = get_hermes_home() / "config.yaml"
+    networks: List[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+
+    if not config_path.exists():
+        with _whitelist_lock:
+            _cached_whitelist = networks
+            _whitelist_cache_time = now
+        return networks
+
+    try:
+        import yaml
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.debug("Failed to load config for SSRF whitelist: %s", exc)
+        with _whitelist_lock:
+            _cached_whitelist = networks
+            _whitelist_cache_time = now
+        return networks
+
+    security = config.get("security", {}) or {}
+    whitelist_raw = security.get("ssrf_whitelist", []) or []
+
+    if not isinstance(whitelist_raw, list):
+        logger.warning("security.ssrf_whitelist must be a list, got %s", type(whitelist_raw).__name__)
+        with _whitelist_lock:
+            _cached_whitelist = networks
+            _whitelist_cache_time = now
+        return networks
+
+    for entry in whitelist_raw:
+        if not isinstance(entry, str):
+            continue
+        try:
+            network = ipaddress.ip_network(entry.strip(), strict=False)
+            networks.append(network)
+            logger.debug("SSRF whitelist: added network %s", network)
+        except ValueError as exc:
+            logger.warning("Invalid SSRF whitelist entry '%s': %s", entry, exc)
+
+    with _whitelist_lock:
+        _cached_whitelist = networks
+        _whitelist_cache_time = now
+
+    return networks
+
+
 def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Return True if the IP should be blocked for SSRF protection."""
+    """Return True if the IP should be blocked for SSRF protection.
+
+    Checks against private/reserved ranges, then exempts IPs that match
+    the user-configured ssrf_whitelist.
+    """
+    # First check if IP is in the whitelist (exempt from blocking)
+    whitelist = _load_ssrf_whitelist()
+    for network in whitelist:
+        if ip in network:
+            logger.debug("IP %s exempted by SSRF whitelist (in %s)", ip, network)
+            return False
+
     if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
         return True
     if ip.is_multicast or ip.is_unspecified:

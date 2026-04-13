@@ -873,6 +873,7 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "domains": [],
             "shared_files": [],
+        "ssrf_whitelist": [],
         },
     },
 
