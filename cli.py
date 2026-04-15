@@ -8843,10 +8843,12 @@ class HermesCLI:
         else:
             try:
                 from hermes_cli.skin_engine import get_active_goodbye
+                from rich import print as rich_print
                 goodbye = get_active_goodbye("Goodbye! ⚕")
             except Exception:
                 goodbye = "Goodbye! ⚕"
-            print(goodbye)
+                rich_print = print
+            rich_print(goodbye)
 
     def _get_tui_prompt_symbols(self) -> tuple[str, str]:
         """Return ``(normal_prompt, state_suffix)`` for the active skin.
